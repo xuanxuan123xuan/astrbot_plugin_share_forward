@@ -103,6 +103,12 @@
     ],
     "hint": "direct_url：直接把视频直链交给 QQ 协议端发送，速度快；download：先下载到本地再发送，兼容性更强但更慢；off：不发送视频文件，只保留直链。"
   },
+  "skip_bilibili_video_in_forward": {
+    "description": "B站视频不放入合并转发",
+    "type": "bool",
+    "default": true,
+    "hint": "建议开启。NapCat 在伪造合并转发中直接拉取 bilivideo.com 视频经常失败，开启后 B站视频只保留直链，避免整条合并转发发送失败。如果把 video_send_mode 改成 download，则此项不会阻止本地视频文件发送。"
+  },
   "max_images_per_forward": {
     "description": "图集最多发送图片数",
     "type": "int",
