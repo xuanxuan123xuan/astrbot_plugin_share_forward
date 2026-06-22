@@ -39,7 +39,7 @@ _RE_URL = re.compile(
     "astrbot_plugin_share_forward",
     "TRAE",
     "把抖音/B站/小红书分享链接解析后打包成 QQ 合并转发",
-    "1.0.9",
+    "1.1.0",
 )
 class ShareForwardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -223,6 +223,7 @@ class ShareForwardPlugin(Star):
     ):
         """按内容类型分组的合并转发。"""
         nodes: List[Comp.Node] = []
+        cleanup_paths: list[str] = []
 
         fc = self.config.get("forward_content", {}) or {}
 
@@ -264,7 +265,7 @@ class ShareForwardPlugin(Star):
 
         # 4) 视频内容
         if fc.get("include_video_file", True) and item.video_url:
-            video_component = await self._build_video_component(item)
+            video_component = await self._build_video_component(item, cleanup_paths)
             if video_component:
                 self._append_section(nodes, bot_uin, bot_name, "🎬 视频内容")
                 nodes.append(
@@ -295,7 +296,10 @@ class ShareForwardPlugin(Star):
             )
             return
 
-        yield event.chain_result([Comp.Nodes(nodes)])
+        try:
+            yield event.chain_result([Comp.Nodes(nodes)])
+        finally:
+            self._cleanup_downloaded_files(cleanup_paths)
 
     async def _send_forward_flat(
         self,
@@ -306,6 +310,7 @@ class ShareForwardPlugin(Star):
     ):
         """旧版平铺合并转发，作为兼容模式保留。"""
         nodes: List[Comp.Node] = []
+        cleanup_paths: list[str] = []
 
         fc = self.config.get("forward_content", {}) or {}
 
@@ -339,7 +344,7 @@ class ShareForwardPlugin(Star):
                 )
 
         if fc.get("include_video_file", True) and item.video_url:
-            video_component = await self._build_video_component(item)
+            video_component = await self._build_video_component(item, cleanup_paths)
             if video_component:
                 nodes.append(
                     Comp.Node(
@@ -365,33 +370,40 @@ class ShareForwardPlugin(Star):
             )
             return
 
-        yield event.chain_result([Comp.Nodes(nodes)])
+        try:
+            yield event.chain_result([Comp.Nodes(nodes)])
+        finally:
+            self._cleanup_downloaded_files(cleanup_paths)
 
     async def _send_fallback(self, event: AstrMessageEvent, item: ParsedItem):
         """非 QQ 平台：降级为多条普通消息。"""
         fc = self.config.get("forward_content", {}) or {}
-        # 头部信息
-        yield event.plain_result(self._format_title_block(item))
-        if fc.get("include_text_desc", True) and item.desc and item.desc != item.title:
-            yield event.plain_result(item.desc)
+        cleanup_paths: list[str] = []
+        try:
+            # 头部信息
+            yield event.plain_result(self._format_title_block(item))
+            if fc.get("include_text_desc", True) and item.desc and item.desc != item.title:
+                yield event.plain_result(item.desc)
 
-        if fc.get("include_cover", True):
-            if item.item_type == "images":
-                for img in self._limit_images(item.images):
-                    await event.send(MessageChain([Comp.Image.fromURL(img)]))
-            elif item.cover:
-                await event.send(MessageChain([Comp.Image.fromURL(item.cover)]))
+            if fc.get("include_cover", True):
+                if item.item_type == "images":
+                    for img in self._limit_images(item.images):
+                        await event.send(MessageChain([Comp.Image.fromURL(img)]))
+                elif item.cover:
+                    await event.send(MessageChain([Comp.Image.fromURL(item.cover)]))
 
-        if fc.get("include_video_file", True) and item.video_url:
-            video_component = await self._build_video_component(item)
-            if video_component:
-                await event.send(MessageChain([video_component]))
+            if fc.get("include_video_file", True) and item.video_url:
+                video_component = await self._build_video_component(item, cleanup_paths)
+                if video_component:
+                    await event.send(MessageChain([video_component]))
 
-        if fc.get("include_top_comments", True) and item.comments:
-            yield event.plain_result("热门评论 Top 3:\n" + self._format_comments_block(item))
+            if fc.get("include_top_comments", True) and item.comments:
+                yield event.plain_result("热门评论 Top 3:\n" + self._format_comments_block(item))
 
-        if fc.get("include_links", True):
-            yield event.plain_result(self._format_link_block(item))
+            if fc.get("include_links", True):
+                yield event.plain_result(self._format_link_block(item))
+        finally:
+            self._cleanup_downloaded_files(cleanup_paths)
 
     # ------------------------------------------------------------------ #
     # 文本块构建
@@ -584,7 +596,11 @@ class ShareForwardPlugin(Star):
             return images
         return images[:max_images]
 
-    async def _build_video_component(self, item: ParsedItem):
+    async def _build_video_component(
+        self,
+        item: ParsedItem,
+        cleanup_paths: Optional[list[str]] = None,
+    ):
         if item.platform == "bilibili":
             mode = self.config.get("bilibili_video_send_mode", "download")
         else:
@@ -600,8 +616,22 @@ class ShareForwardPlugin(Star):
                 return None
         if mode == "download":
             video_path = await self._download_video(item)
+            if video_path and self.config.get("cleanup_downloaded_video", True):
+                if cleanup_paths is not None:
+                    cleanup_paths.append(video_path)
             return Comp.Video.fromFileSystem(video_path) if video_path else None
         return None
+
+    def _cleanup_downloaded_files(self, paths: list[str]):
+        if not self.config.get("cleanup_downloaded_video", True):
+            return
+        for path in paths:
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+                    self._dlog(f"已清理下载视频: {path}")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[share_forward] 清理下载视频失败: {path}, {e}")
 
     def _dlog(self, msg: str):
         if self.config.get("debug_log"):

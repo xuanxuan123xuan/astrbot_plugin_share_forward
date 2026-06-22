@@ -92,6 +92,12 @@
     "default": 80,
     "hint": "仅在“视频发送模式”为 download 时生效。超过此体积的视频不会作为视频文件直发，只保留直链。建议 50-100。"
   },
+  "cleanup_downloaded_video": {
+    "description": "发送后清理下载视频",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，download 模式临时下载的视频会在发送流程结束后自动删除，避免临时目录堆积。关闭后会保留下载文件用于缓存复用。"
+  },
   "video_send_mode": {
     "description": "视频发送模式",
     "type": "string",
