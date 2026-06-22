@@ -32,10 +32,9 @@
 - 合并转发默认按内容分类展示：📌解析信息、📝正文内容、🖼️图片内容、🎬视频内容、💬热门评论、🔗链接信息。
 - 支持同链接防抖、解析重试、代理、群/会话白名单、私聊开关。
 - 支持视频发送模式：
-  - `direct_url`：直接把视频直链交给 QQ 协议端发送，速度快
-  - `download`：先下载到本地再发送，兼容性更强但更慢
-  - `off`：不发送视频文件，只保留直链
-- B 站视频默认不放入伪造合并转发的视频节点，只保留视频直链，避免 NapCat 拉取 `bilivideo.com` 视频失败导致整条合并转发发送失败。
+  - 抖音/小红书：使用全局 `video_send_mode`，支持 `direct_url` / `download` / `off`
+  - B 站：使用独立 `bilibili_video_send_mode`，只支持 `download` / `off`
+  - B 站默认 `download`，插件先下载视频再放入合并转发，避免 NapCat 直接拉取 `bilivideo.com` 链接失败。
 - `v1.0.2` 修复抖音分享页不返回旧 `_ROUTER_DATA` 时的解析失败问题，增加移动端 UA、括号配平提取、`douyin.com/video/{id}` 页面兜底和旧 `iteminfo` 接口兜底。
 - `v1.0.3` 参考 `drdon1234/astrbot_plugin_douyin_bot` 的可用路径：短链优先 `HEAD` 跟随、宽松提取数字 ID、优先从 `loaderData -> videoInfoRes -> item_list[0]` 解析抖音内容，并补充触发提示消息。
 - `v1.0.4` 新增合并转发分组模式，默认按内容分类插入标题节点；同时去掉解析信息里的平台标签，只保留内容类型、标题、作者。
@@ -43,6 +42,7 @@
 - `v1.0.6` 精简热门评论格式：去掉用户名、点赞数和数字序号，改用 🥇🥈🥉 奖牌展示前三条评论。
 - `v1.0.7` 修复 B 站原视频不出现的问题，新增 `x/player/playurl` 播放流获取逻辑。
 - `v1.0.8` 修复 NapCat 发送 B 站视频合并转发时报 `handleOb11FileLikeMessage terminated` 的问题：默认不把 B站 CDN 视频 URL 放进伪造合并转发视频节点，只在链接信息里保留视频直链。
+- `v1.0.9` 将 B 站视频发送改为独立设置 `bilibili_video_send_mode`，只保留 `download` 和 `off` 两个选项，默认 `download`。
 
 ## 🔧 安装
 
@@ -60,8 +60,8 @@
 | `platforms` | 启用哪些平台（抖音 / B 站 / 小红书） |
 | `forward_content` | 合并转发节点包含哪些内容 |
 | `use_forward_message` | 是否使用 QQ 合并转发，不稳定时可关闭 |
-| `video_send_mode` | 视频发送模式：`direct_url` / `download` / `off` |
-| `skip_bilibili_video_in_forward` | B 站视频默认不放入合并转发视频节点，避免 NapCat 拉流失败 |
+| `video_send_mode` | 抖音/小红书视频发送模式：`direct_url` / `download` / `off` |
+| `bilibili_video_send_mode` | B 站视频发送模式：`download` / `off`，默认 `download` |
 | `video_max_size_mb` | 视频文件直发的最大体积（MB） |
 | `max_images_per_forward` | 图集最多发送图片数量 |
 | `request_timeout` | 单次请求超时（秒） |
