@@ -47,6 +47,7 @@
 - `v1.1.0` 新增 `cleanup_downloaded_video`，默认发送流程结束后自动清理 download 模式下载的视频文件。
 - `v1.1.1` 修复清理过早导致 NapCat 报 `ENOENT: no such file or directory` 的问题，改为默认延迟 600 秒清理临时视频。
 - `v1.1.2` 修复 AstrBot 与 NapCat 不在同一容器时 B 站 `download` 模式仍报 `ENOENT` 的问题：新增插件内置 HTTP 文件服务、共享目录模式和可配置下载目录，避免把 AstrBot 容器内的 `/tmp` 路径直接交给 NapCat。
+- `v1.1.3` 修复部分 B 站视频热评为空的问题：同时兼容 `top_replies`、新版评论主接口和旧版热度排序接口，并新增可选 B站 Cookie 配置。
 
 ## 🔧 安装
 
@@ -85,6 +86,7 @@
 | `group_whitelist` | 群号白名单，留空表示不限 |
 | `id_whitelist` | 统一会话白名单，适合精确限制触发范围 |
 | `douyin_cookie` | 抖音 Cookie（拉取评论用，可选） |
+| `bilibili_cookie` | B站 Cookie（可选，用于提升热评获取成功率） |
 | `xiaohongshu_cookie` | 小红书 Cookie（**必填**，至少含 `a1=...`） |
 | `stop_event_after_match` | 命中后阻断后续 LLM 处理 |
 | `reply_when_fail` | 解析失败时给用户反馈 |

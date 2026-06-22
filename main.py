@@ -73,7 +73,7 @@ class _ShareForwardVideoHandler(SimpleHTTPRequestHandler):
     "astrbot_plugin_share_forward",
     "TRAE",
     "把抖音/B站/小红书分享链接解析后打包成 QQ 合并转发",
-    "1.1.2",
+    "1.1.3",
 )
 class ShareForwardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -99,6 +99,7 @@ class ShareForwardPlugin(Star):
                 "include_top_comments", True
             ),
             "douyin_cookie": self.config.get("douyin_cookie", ""),
+            "bilibili_cookie": self.config.get("bilibili_cookie", ""),
             "xiaohongshu_cookie": self.config.get("xiaohongshu_cookie", ""),
         }
 

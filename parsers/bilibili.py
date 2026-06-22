@@ -111,29 +111,79 @@ class BilibiliParser(BaseParser):
             try:
                 aid_for_reply = info.get("aid") or aid
                 if aid_for_reply:
-                    rc = await self.http.get(
-                        "https://api.bilibili.com/x/v2/reply/main",
-                        params={
-                            "type": 1,
-                            "oid": aid_for_reply,
-                            "mode": 3,  # 按热度
-                            "next": 0,
-                        },
-                        headers=_HEADERS,
-                    )
-                    rj = rc.json()
-                    if rj.get("code") == 0:
-                        replies = (rj.get("data") or {}).get("replies") or []
-                        for rep in replies[:3]:
-                            item.comments.append({
-                                "user": (rep.get("member") or {}).get("uname", ""),
-                                "content": (rep.get("content") or {}).get("message", ""),
-                                "like": str(rep.get("like", 0)),
-                            })
+                    item.comments.extend(await self._fetch_top_comments(aid_for_reply))
             except Exception as e:  # noqa: BLE001
                 self.logger.debug(f"[bilibili] 评论拉取失败: {e}")
 
         return item
+
+    async def _fetch_top_comments(self, aid: int) -> list[dict[str, str]]:
+        """拉取 B 站热评。兼容新版 main 接口和旧版 reply 接口。"""
+        headers = dict(_HEADERS)
+        cookie = (self.config.get("bilibili_cookie") or "").strip()
+        if cookie:
+            headers["Cookie"] = cookie
+
+        candidates: list[dict] = []
+
+        # 新版评论主接口：热评可能在 top_replies，也可能在 replies。
+        rc = await self.http.get(
+            "https://api.bilibili.com/x/v2/reply/main",
+            params={
+                "type": 1,
+                "oid": aid,
+                "mode": 3,
+                "next": 0,
+                "ps": 20,
+                "plat": 1,
+            },
+            headers=headers,
+        )
+        rj = rc.json()
+        if rj.get("code") == 0:
+            data = rj.get("data") or {}
+            candidates.extend(data.get("top_replies") or [])
+            candidates.extend(data.get("replies") or [])
+        else:
+            self.logger.debug(f"[bilibili] reply/main 返回错误: {rj.get('message')}")
+
+        # 兜底旧接口：有些环境 main 接口为空，但旧接口还能拿到按热度排序的评论。
+        if len(candidates) < 3:
+            old = await self.http.get(
+                "https://api.bilibili.com/x/v2/reply",
+                params={
+                    "type": 1,
+                    "oid": aid,
+                    "sort": 2,
+                    "pn": 1,
+                    "ps": 20,
+                },
+                headers=headers,
+            )
+            oj = old.json()
+            if oj.get("code") == 0:
+                data = oj.get("data") or {}
+                candidates.extend(data.get("top_replies") or [])
+                candidates.extend(data.get("replies") or [])
+            else:
+                self.logger.debug(f"[bilibili] reply 返回错误: {oj.get('message')}")
+
+        comments: list[dict[str, str]] = []
+        seen: set[str] = set()
+        candidates.sort(key=lambda x: int(x.get("like", 0) or 0), reverse=True)
+        for rep in candidates:
+            content = ((rep.get("content") or {}).get("message") or "").strip()
+            if not content or content in seen:
+                continue
+            seen.add(content)
+            comments.append({
+                "user": (rep.get("member") or {}).get("uname", ""),
+                "content": content,
+                "like": str(rep.get("like", 0)),
+            })
+            if len(comments) >= 3:
+                break
+        return comments
 
     async def _fetch_play_url(self, info: dict) -> str:
         bvid = info.get("bvid")
