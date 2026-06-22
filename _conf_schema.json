@@ -96,7 +96,19 @@
     "description": "发送后清理下载视频",
     "type": "bool",
     "default": true,
-    "hint": "开启后，download 模式临时下载的视频会在发送流程结束后自动删除，避免临时目录堆积。关闭后会保留下载文件用于缓存复用。"
+    "hint": "开启后，download 模式临时下载的视频会延迟自动删除，避免临时目录堆积。关闭后会保留下载文件用于缓存复用。"
+  },
+  "cleanup_downloaded_video_delay": {
+    "description": "下载视频延迟清理秒数",
+    "type": "int",
+    "default": 600,
+    "hint": "download 模式发送后等待多少秒再删除临时视频。不能太短，否则 NapCat 可能还没读取文件就被删掉。建议 300-900。"
+  },
+  "download_video_dir": {
+    "description": "视频下载目录",
+    "type": "string",
+    "default": "",
+    "hint": "download 模式下载视频保存到哪里。留空则使用系统临时目录下的 share_forward_videos。Docker/1Panel 用户可填 AstrBot 容器内的固定目录，便于排查和共享挂载。"
   },
   "video_send_mode": {
     "description": "视频发送模式",
@@ -117,7 +129,49 @@
       "download",
       "off"
     ],
-    "hint": "download：插件先下载 B站视频，再作为本地视频文件放入合并转发，兼容 NapCat；off：不发送 B站视频文件，只保留视频直链。B站不提供 direct_url 选项，因为 NapCat 直接拉 bilivideo.com 链接容易失败。"
+    "hint": "download：插件先下载 B站视频，再按下面的“B站下载视频访问方式”交给 NapCat；off：不发送 B站视频文件，只保留视频直链。B站不提供 direct_url 选项，因为 NapCat 直接拉 bilivideo.com 链接容易失败。"
+  },
+  "bilibili_download_access_mode": {
+    "description": "B站下载视频访问方式",
+    "type": "string",
+    "default": "auto",
+    "options": [
+      "auto",
+      "http_server",
+      "shared_dir",
+      "local_file"
+    ],
+    "hint": "auto：优先使用插件内置 HTTP 文件服务，其次共享目录；http_server：AstrBot 开一个临时 HTTP 服务给 NapCat 拉视频，推荐 Docker/1Panel；shared_dir：AstrBot 和 NapCat 共享同一个挂载目录；local_file：仅适合两者在同一容器或同一文件系统。"
+  },
+  "bilibili_file_server_base_url": {
+    "description": "B站视频 HTTP 访问地址",
+    "type": "string",
+    "default": "",
+    "hint": "NapCat 能访问到 AstrBot 插件内置文件服务的地址，例如 http://astrbot:6186。Docker/1Panel 同网络时通常填写 AstrBot 容器名加端口。留空则 auto 模式不会启用 HTTP 文件服务。"
+  },
+  "bilibili_file_server_host": {
+    "description": "B站视频 HTTP 监听地址",
+    "type": "string",
+    "default": "0.0.0.0",
+    "hint": "插件内置 HTTP 文件服务监听地址。Docker/1Panel 一般保持 0.0.0.0。"
+  },
+  "bilibili_file_server_port": {
+    "description": "B站视频 HTTP 监听端口",
+    "type": "int",
+    "default": 6186,
+    "hint": "插件内置 HTTP 文件服务端口。NapCat 需要能通过 bilibili_file_server_base_url 访问这个端口。"
+  },
+  "bilibili_file_server_token": {
+    "description": "B站视频 HTTP 访问令牌",
+    "type": "string",
+    "default": "",
+    "hint": "可选。填写后，插件生成的视频 URL 会带 token 参数，只有 token 正确才能访问视频文件。内网环境可留空。"
+  },
+  "bilibili_shared_video_dir": {
+    "description": "B站共享目录路径",
+    "type": "string",
+    "default": "",
+    "hint": "仅 shared_dir 模式使用。填写 NapCat 容器里能看到的视频目录路径，文件名会自动拼接。该目录应与 download_video_dir 指向同一个共享挂载。"
   },
   "max_images_per_forward": {
     "description": "图集最多发送图片数",

@@ -4,12 +4,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 import tempfile
+import threading
 import time
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import List, Optional
+from urllib.parse import parse_qs, quote, urlparse
 
 import httpx
 
@@ -35,11 +40,40 @@ _RE_URL = re.compile(
 )
 
 
+class _ShareForwardVideoHandler(SimpleHTTPRequestHandler):
+    """给 NapCat 跨容器拉取临时视频用的轻量 HTTP 文件服务。"""
+
+    def __init__(self, *args, directory: str, token: str = "", **kwargs):
+        self._token = token
+        super().__init__(*args, directory=directory, **kwargs)
+
+    def _authorized(self) -> bool:
+        if not self._token:
+            return True
+        query = parse_qs(urlparse(self.path).query)
+        return (query.get("token") or [""])[0] == self._token
+
+    def do_GET(self):  # noqa: N802
+        if not self._authorized():
+            self.send_error(403, "Forbidden")
+            return
+        super().do_GET()
+
+    def do_HEAD(self):  # noqa: N802
+        if not self._authorized():
+            self.send_error(403, "Forbidden")
+            return
+        super().do_HEAD()
+
+    def log_message(self, format: str, *args):  # noqa: A002
+        return
+
+
 @register(
     "astrbot_plugin_share_forward",
     "TRAE",
     "把抖音/B站/小红书分享链接解析后打包成 QQ 合并转发",
-    "1.1.0",
+    "1.1.2",
 )
 class ShareForwardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -48,6 +82,8 @@ class ShareForwardPlugin(Star):
         self._http: Optional[httpx.AsyncClient] = None
         self._parsers: List[BaseParser] = []
         self._recent_links: dict[str, float] = {}
+        self._file_server: Optional[ThreadingHTTPServer] = None
+        self._file_server_thread: Optional[threading.Thread] = None
         self._build_parsers()
 
     # ------------------------------------------------------------------ #
@@ -93,6 +129,14 @@ class ShareForwardPlugin(Star):
                 await self._http.aclose()
             except Exception:  # noqa: BLE001
                 pass
+        if self._file_server:
+            try:
+                self._file_server.shutdown()
+                self._file_server.server_close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._file_server = None
+            self._file_server_thread = None
 
     # ------------------------------------------------------------------ #
     # 主消息处理
@@ -299,7 +343,7 @@ class ShareForwardPlugin(Star):
         try:
             yield event.chain_result([Comp.Nodes(nodes)])
         finally:
-            self._cleanup_downloaded_files(cleanup_paths)
+            self._schedule_cleanup_downloaded_files(cleanup_paths)
 
     async def _send_forward_flat(
         self,
@@ -373,7 +417,7 @@ class ShareForwardPlugin(Star):
         try:
             yield event.chain_result([Comp.Nodes(nodes)])
         finally:
-            self._cleanup_downloaded_files(cleanup_paths)
+            self._schedule_cleanup_downloaded_files(cleanup_paths)
 
     async def _send_fallback(self, event: AstrMessageEvent, item: ParsedItem):
         """非 QQ 平台：降级为多条普通消息。"""
@@ -403,7 +447,7 @@ class ShareForwardPlugin(Star):
             if fc.get("include_links", True):
                 yield event.plain_result(self._format_link_block(item))
         finally:
-            self._cleanup_downloaded_files(cleanup_paths)
+            self._schedule_cleanup_downloaded_files(cleanup_paths)
 
     # ------------------------------------------------------------------ #
     # 文本块构建
@@ -454,8 +498,10 @@ class ShareForwardPlugin(Star):
         if item.video_referer:
             headers["Referer"] = item.video_referer
 
-        tmp_dir = tempfile.gettempdir()
-        path = os.path.join(tmp_dir, f"share_fwd_{item.platform}_{abs(hash(url))}.mp4")
+        tmp_dir = self._get_download_dir()
+        os.makedirs(tmp_dir, exist_ok=True)
+        digest = hashlib.sha256(url.encode("utf-8", errors="ignore")).hexdigest()[:16]
+        path = os.path.join(tmp_dir, f"share_fwd_{item.platform}_{digest}.mp4")
         try:
             async with self._http.stream("GET", url, headers=headers, follow_redirects=True) as r:
                 if r.status_code != 200:
@@ -619,8 +665,118 @@ class ShareForwardPlugin(Star):
             if video_path and self.config.get("cleanup_downloaded_video", True):
                 if cleanup_paths is not None:
                     cleanup_paths.append(video_path)
+            if item.platform == "bilibili":
+                return self._build_bilibili_download_video_component(video_path)
             return Comp.Video.fromFileSystem(video_path) if video_path else None
         return None
+
+    def _get_download_dir(self) -> str:
+        cfg_dir = (self.config.get("download_video_dir") or "").strip()
+        if cfg_dir:
+            return cfg_dir
+        return os.path.join(tempfile.gettempdir(), "share_forward_videos")
+
+    def _build_bilibili_download_video_component(self, video_path: Optional[str]):
+        if not video_path:
+            return None
+
+        access_mode = self.config.get("bilibili_download_access_mode", "auto")
+        if access_mode == "auto":
+            if (self.config.get("bilibili_file_server_base_url") or "").strip():
+                access_mode = "http_server"
+            elif (self.config.get("bilibili_shared_video_dir") or "").strip():
+                access_mode = "shared_dir"
+            else:
+                access_mode = "off"
+
+        if access_mode == "http_server":
+            url = self._build_video_http_url(video_path)
+            if url:
+                return Comp.Video.fromURL(url)
+            self._dlog("B站 HTTP 文件服务不可用，已跳过视频文件节点")
+            return None
+
+        if access_mode == "shared_dir":
+            path = self._build_shared_video_path(video_path)
+            if path:
+                return Comp.Video.fromFileSystem(path)
+            self._dlog("B站共享目录路径不可用，已跳过视频文件节点")
+            return None
+
+        if access_mode == "local_file":
+            # 仅适合 AstrBot 与 NapCat 在同一文件系统/同一容器时使用。
+            return Comp.Video.fromFileSystem(video_path)
+
+        logger.warning(
+            "[share_forward] B站 download 已下载视频，但未配置跨容器访问方式；"
+            "请配置 bilibili_file_server_base_url 或 bilibili_shared_video_dir，"
+            "否则将只保留链接信息并跳过视频文件节点"
+        )
+        return None
+
+    def _build_video_http_url(self, video_path: str) -> Optional[str]:
+        base_url = (self.config.get("bilibili_file_server_base_url") or "").strip().rstrip("/")
+        if not base_url:
+            return None
+        if not self._ensure_file_server():
+            return None
+
+        filename = os.path.basename(video_path)
+        url = f"{base_url}/{quote(filename)}"
+        token = (self.config.get("bilibili_file_server_token") or "").strip()
+        if token:
+            url += f"?token={quote(token)}"
+        return url
+
+    def _ensure_file_server(self) -> bool:
+        if self._file_server:
+            return True
+
+        download_dir = self._get_download_dir()
+        os.makedirs(download_dir, exist_ok=True)
+        host = (self.config.get("bilibili_file_server_host") or "0.0.0.0").strip()
+        port = int(self.config.get("bilibili_file_server_port", 6186) or 6186)
+        token = (self.config.get("bilibili_file_server_token") or "").strip()
+
+        try:
+            handler = partial(
+                _ShareForwardVideoHandler,
+                directory=download_dir,
+                token=token,
+            )
+            server = ThreadingHTTPServer((host, port), handler)
+            server.daemon_threads = True
+            thread = threading.Thread(
+                target=server.serve_forever,
+                name="share-forward-video-server",
+                daemon=True,
+            )
+            thread.start()
+            self._file_server = server
+            self._file_server_thread = thread
+            self._dlog(f"B站视频 HTTP 文件服务已启动: {host}:{port}, 目录: {download_dir}")
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[share_forward] 启动 B站视频 HTTP 文件服务失败: {e}")
+            return False
+
+    def _build_shared_video_path(self, video_path: str) -> Optional[str]:
+        shared_dir = (self.config.get("bilibili_shared_video_dir") or "").strip()
+        if not shared_dir:
+            return None
+        return os.path.join(shared_dir, os.path.basename(video_path))
+
+    def _schedule_cleanup_downloaded_files(self, paths: list[str]):
+        """延迟清理下载文件，避免 AstrBot/NapCat 还没读取就被删除。"""
+        if not paths or not self.config.get("cleanup_downloaded_video", True):
+            return
+        delay = int(self.config.get("cleanup_downloaded_video_delay", 600) or 600)
+        asyncio.create_task(self._cleanup_downloaded_files_later(list(paths), delay))
+
+    async def _cleanup_downloaded_files_later(self, paths: list[str], delay: int):
+        if delay > 0:
+            await asyncio.sleep(delay)
+        self._cleanup_downloaded_files(paths)
 
     def _cleanup_downloaded_files(self, paths: list[str]):
         if not self.config.get("cleanup_downloaded_video", True):
