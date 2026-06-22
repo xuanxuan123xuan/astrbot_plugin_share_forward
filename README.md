@@ -68,8 +68,8 @@
 | `video_send_mode` | 抖音/小红书视频发送模式：`direct_url` / `download` / `off` |
 | `bilibili_video_send_mode` | B 站视频发送模式：`download` / `off`，默认 `download` |
 | `bilibili_download_access_mode` | B 站下载视频访问方式：`auto` / `http_server` / `shared_dir` / `local_file` |
-| `bilibili_file_server_base_url` | NapCat 访问 AstrBot 插件内置视频文件服务的地址，例如 `http://astrbot:6186` |
-| `bilibili_file_server_host` | 插件内置视频文件服务监听地址，Docker/1Panel 一般保持 `0.0.0.0` |
+| `bilibili_file_server_base_url` | NapCat 访问 AstrBot 插件内置视频文件服务的地址，例如 `http://astrbot:6186` 或 `http://172.18.0.4:6186` |
+| `bilibili_file_server_host` | 插件内置视频文件服务监听地址，一般保持 `0.0.0.0` |
 | `bilibili_file_server_port` | 插件内置视频文件服务端口，默认 `6186` |
 | `bilibili_file_server_token` | 可选访问令牌，填写后视频 URL 会带 token 参数 |
 | `download_video_dir` | download 模式的视频下载目录，留空则使用系统临时目录下的 `share_forward_videos` |
@@ -99,27 +99,40 @@
 3. 复制完整 Cookie 字符串（格式：`key1=value1; key2=value2; ...`）
 4. 粘贴到对应配置项
 
-### B 站 download 跨容器配置
+### B 站 download 视频访问配置
 
-如果 AstrBot 和 NapCat 分别运行在两个 Docker/1Panel 容器里，不要使用 `local_file`，因为 NapCat 看不到 AstrBot 容器内的 `/tmp/xxx.mp4`。
+B 站的视频直链经常不能被 NapCat 直接拉取，所以插件默认会先把视频下载到 AstrBot 所在环境，再把视频交给 NapCat。这里最容易出问题的是“NapCat 能不能看到这个视频文件”。
 
-推荐使用插件内置 HTTP 文件服务：
+如果 AstrBot 和 NapCat 不在同一个文件系统里，例如分别运行在两个 Docker 容器、两台机器、两个隔离环境中，不要使用 `local_file`。这种情况下 NapCat 看不到 AstrBot 本地的 `/tmp/xxx.mp4`，容易报 `ENOENT`。
+
+推荐优先使用 HTTP 文件服务。插件会在 AstrBot 所在环境里临时开一个只用于视频文件的 HTTP 服务，NapCat 通过这个地址拉取视频：
 
 ```text
 bilibili_video_send_mode = download
 bilibili_download_access_mode = auto
-bilibili_file_server_base_url = http://AstrBot容器名:6186
+bilibili_file_server_base_url = http://AstrBot地址:6186
 bilibili_file_server_host = 0.0.0.0
 bilibili_file_server_port = 6186
 ```
 
-如果两个容器都加入了同一个 `1panel-network`，`bilibili_file_server_base_url` 通常可以填写 AstrBot 的容器名或 1Panel 服务名，例如：
+`bilibili_file_server_base_url` 要填 NapCat 能访问到的地址，不一定是公网地址。
+
+常见填写方式：
 
 ```text
+# Docker / Compose / 1Panel 等同网络容器
 http://astrbot:6186
+
+# 已知 AstrBot 容器内网 IP
+http://172.18.0.4:6186
+
+# NapCat 和 AstrBot 在不同机器，但 NapCat 能访问这台主机
+http://192.168.1.10:6186
 ```
 
-也可以使用共享目录模式：
+如果 NapCat 和 AstrBot 在同一个 Docker 网络里，通常不需要把 `6186` 映射到公网，也不需要开放服务器防火墙；只要 NapCat 能访问 `bilibili_file_server_base_url` 即可。如果 NapCat 在另一台机器上，才需要保证对应地址和端口能被它访问。
+
+也可以使用共享目录模式。适合你已经把同一个宿主机目录或 NAS 目录挂载给 AstrBot 和 NapCat 的情况：
 
 ```text
 download_video_dir = /data/share_forward_videos
@@ -127,7 +140,13 @@ bilibili_download_access_mode = shared_dir
 bilibili_shared_video_dir = /data/share_forward_videos
 ```
 
-共享目录模式要求 AstrBot 和 NapCat 都挂载同一个宿主机目录，并且 `bilibili_shared_video_dir` 是 NapCat 容器里能看到的路径。
+`download_video_dir` 是 AstrBot 写入视频的位置，`bilibili_shared_video_dir` 是 NapCat 读取视频的位置。两边路径可以相同，也可以不同，但它们必须指向同一批真实文件。
+
+只有在 AstrBot 和 NapCat 运行在同一个容器、同一台机器且能看到完全相同的文件路径时，才建议使用：
+
+```text
+bilibili_download_access_mode = local_file
+```
 
 ## 🧩 工作原理
 
