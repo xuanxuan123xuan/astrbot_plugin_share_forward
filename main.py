@@ -1,0 +1,630 @@
+"""astrbot_plugin_share_forward
+将抖音/B站/小红书等主流平台的分享链接，解析后打包成一条 QQ 合并转发消息。
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import tempfile
+import time
+from typing import List, Optional
+
+import httpx
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.star import Context, Star, register
+import astrbot.api.message_components as Comp
+
+from .parsers import (
+    BaseParser,
+    BilibiliParser,
+    DouyinParser,
+    ParseError,
+    ParsedItem,
+    XiaohongshuParser,
+)
+
+
+_RE_URL = re.compile(
+    r"(https?://[^\s\u4e00-\u9fa5\"'<>]+|"
+    r"(?:v\.douyin\.com|b23\.tv|xhslink\.com)/[A-Za-z0-9_\-/]+)",
+    re.IGNORECASE,
+)
+
+
+@register(
+    "astrbot_plugin_share_forward",
+    "TRAE",
+    "把抖音/B站/小红书分享链接解析后打包成 QQ 合并转发",
+    "1.0.7",
+)
+class ShareForwardPlugin(Star):
+    def __init__(self, context: Context, config: dict):
+        super().__init__(context)
+        self.config = config or {}
+        self._http: Optional[httpx.AsyncClient] = None
+        self._parsers: List[BaseParser] = []
+        self._recent_links: dict[str, float] = {}
+        self._build_parsers()
+
+    # ------------------------------------------------------------------ #
+    # 生命周期
+    # ------------------------------------------------------------------ #
+    def _build_parsers(self):
+        platforms = self.config.get("platforms", {}) or {}
+        timeout = int(self.config.get("request_timeout", 15) or 15)
+        self._http = self._make_http_client(timeout)
+
+        common_cfg = {
+            "include_top_comments": (self.config.get("forward_content", {}) or {}).get(
+                "include_top_comments", True
+            ),
+            "douyin_cookie": self.config.get("douyin_cookie", ""),
+            "xiaohongshu_cookie": self.config.get("xiaohongshu_cookie", ""),
+        }
+
+        if platforms.get("douyin", True):
+            self._parsers.append(DouyinParser(self._http, logger, common_cfg))
+        if platforms.get("bilibili", True):
+            self._parsers.append(BilibiliParser(self._http, logger, common_cfg))
+        if platforms.get("xiaohongshu", True):
+            self._parsers.append(XiaohongshuParser(self._http, logger, common_cfg))
+
+    def _make_http_client(self, timeout: int) -> httpx.AsyncClient:
+        proxy = (self.config.get("proxy") or "").strip()
+        kwargs = {"timeout": timeout, "follow_redirects": False}
+        if proxy:
+            kwargs["proxy"] = proxy
+        try:
+            return httpx.AsyncClient(**kwargs)
+        except TypeError:
+            # 兼容较老 httpx 的 proxies 参数
+            if proxy:
+                kwargs.pop("proxy", None)
+                kwargs["proxies"] = proxy
+            return httpx.AsyncClient(**kwargs)
+
+    async def terminate(self):
+        if self._http:
+            try:
+                await self._http.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ------------------------------------------------------------------ #
+    # 主消息处理
+    # ------------------------------------------------------------------ #
+    @filter.regex(r"[\s\S]+")
+    async def on_message(self, event: AstrMessageEvent):
+        if not self.config.get("enabled", True):
+            return
+
+        denied = self._check_access(event)
+        if denied is not None:
+            if denied != "BLOCKED":
+                yield denied
+            return
+
+        text = self._extract_text(event)
+        if not text:
+            return
+
+        urls = _RE_URL.findall(text)
+        if not urls:
+            return
+
+        # 找到第一条能解析的 URL
+        for raw in urls:
+            url = raw if raw.startswith("http") else "https://" + raw
+            parser = await self._select_parser(url)
+            if parser is None:
+                continue
+
+            if self._is_debounced(event, url):
+                self._dlog(f"链接在防抖窗口内，跳过: {url}")
+                return
+
+            self._dlog(f"匹配到 {parser.platform} 链接: {url}")
+            if self.config.get("notify_when_triggered", True):
+                yield event.plain_result("解析bot为您服务 ٩( 'ω' )و")
+
+            try:
+                item = await self._parse_with_retry(parser, url)
+                self._mark_debounce(event, url)
+            except ParseError as e:
+                logger.warning(f"[share_forward] {parser.platform} 解析失败: {e}")
+                if self.config.get("reply_when_fail", True):
+                    yield event.plain_result(
+                        f"[分享解析] {parser.platform} 解析失败：{e}"
+                    )
+                if self.config.get("stop_event_after_match", True):
+                    event.stop_event()
+                return
+            except Exception as e:  # noqa: BLE001
+                logger.exception(f"[share_forward] {parser.platform} 解析异常: {e}")
+                if self.config.get("reply_when_fail", True):
+                    yield event.plain_result(
+                        f"[分享解析] {parser.platform} 解析异常：{e}"
+                    )
+                if self.config.get("stop_event_after_match", True):
+                    event.stop_event()
+                return
+
+            # 构建合并转发或降级消息
+            try:
+                async for chain in self._dispatch_send(event, item):
+                    yield chain
+            except Exception as e:  # noqa: BLE001
+                logger.exception(f"[share_forward] 发送失败: {e}")
+                if self.config.get("reply_when_fail", True):
+                    yield event.plain_result(f"[分享解析] 发送失败：{e}")
+
+            if self.config.get("stop_event_after_match", True):
+                event.stop_event()
+            return
+
+    async def _select_parser(self, url: str) -> Optional[BaseParser]:
+        for p in self._parsers:
+            try:
+                if await p.can_parse(url):
+                    return p
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    async def _parse_with_retry(self, parser: BaseParser, url: str) -> ParsedItem:
+        retry = int(self.config.get("retry_count", 1) or 0)
+        last_error: Exception | None = None
+        for attempt in range(retry + 1):
+            try:
+                return await parser.parse(url)
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+                if attempt < retry:
+                    await asyncio.sleep(0.8 * (attempt + 1))
+        assert last_error is not None
+        raise last_error
+
+    # ------------------------------------------------------------------ #
+    # 消息构建
+    # ------------------------------------------------------------------ #
+    async def _dispatch_send(self, event: AstrMessageEvent, item: ParsedItem):
+        platform_name = event.get_platform_name() or ""
+        use_forward = self.config.get("use_forward_message", True)
+        if platform_name == "aiocqhttp" and use_forward:
+            async for chain in self._send_forward(event, item):
+                yield chain
+        else:
+            async for chain in self._send_fallback(event, item):
+                yield chain
+
+    async def _send_forward(self, event: AstrMessageEvent, item: ParsedItem):
+        """构造并发送 QQ 合并转发"""
+        bot_uin = str(event.get_self_id() or "10000")
+        bot_name = "分享解析"
+        mode = self.config.get("forward_grouping_mode", "sectioned")
+        if mode == "flat":
+            async for chain in self._send_forward_flat(event, item, bot_uin, bot_name):
+                yield chain
+            return
+
+        async for chain in self._send_forward_sectioned(event, item, bot_uin, bot_name):
+            yield chain
+
+    async def _send_forward_sectioned(
+        self,
+        event: AstrMessageEvent,
+        item: ParsedItem,
+        bot_uin: str,
+        bot_name: str,
+    ):
+        """按内容类型分组的合并转发。"""
+        nodes: List[Comp.Node] = []
+
+        fc = self.config.get("forward_content", {}) or {}
+
+        # 1) 解析信息
+        if fc.get("include_title_author", True):
+            self._append_section(nodes, bot_uin, bot_name, "📌 解析信息")
+            self._append_plain_node(nodes, bot_uin, bot_name, self._format_title_block(item))
+
+        # 2) 正文内容
+        if fc.get("include_text_desc", True) and item.desc and item.desc != item.title:
+            self._append_section(nodes, bot_uin, bot_name, "📝 正文内容")
+            self._append_plain_node(nodes, bot_uin, bot_name, item.desc)
+
+        # 3) 图片内容
+        if fc.get("include_cover", True):
+            if item.item_type == "images" and item.images:
+                self._append_section(nodes, bot_uin, bot_name, "🖼️ 图片内容")
+                images = self._limit_images(item.images)
+                for idx, img in enumerate(images, 1):
+                    nodes.append(
+                        Comp.Node(
+                            uin=bot_uin,
+                            name=bot_name,
+                            content=[
+                                Comp.Plain(f"图 {idx}/{len(images)}"),
+                                Comp.Image.fromURL(img),
+                            ],
+                        )
+                    )
+            elif item.cover:
+                self._append_section(nodes, bot_uin, bot_name, "🖼️ 图片内容")
+                nodes.append(
+                    Comp.Node(
+                        uin=bot_uin,
+                        name=bot_name,
+                        content=[Comp.Image.fromURL(item.cover)],
+                    )
+                )
+
+        # 4) 视频内容
+        if fc.get("include_video_file", True) and item.video_url:
+            video_component = await self._build_video_component(item)
+            if video_component:
+                self._append_section(nodes, bot_uin, bot_name, "🎬 视频内容")
+                nodes.append(
+                    Comp.Node(
+                        uin=bot_uin,
+                        name=bot_name,
+                        content=[video_component],
+                    )
+                )
+
+        # 5) 热门评论
+        if fc.get("include_top_comments", True) and item.comments:
+            self._append_section(nodes, bot_uin, bot_name, "💬 热门评论")
+            self._append_plain_node(
+                nodes, bot_uin, bot_name, self._format_comments_block(item)
+            )
+
+        # 6) 链接信息
+        if fc.get("include_links", True):
+            link_text = self._format_link_block(item)
+            if link_text:
+                self._append_section(nodes, bot_uin, bot_name, "🔗 链接信息")
+                self._append_plain_node(nodes, bot_uin, bot_name, link_text)
+
+        if not nodes:
+            yield event.plain_result(
+                f"[分享解析] 内容已识别，但所有内容节点都被关闭了。"
+            )
+            return
+
+        yield event.chain_result([Comp.Nodes(nodes)])
+
+    async def _send_forward_flat(
+        self,
+        event: AstrMessageEvent,
+        item: ParsedItem,
+        bot_uin: str,
+        bot_name: str,
+    ):
+        """旧版平铺合并转发，作为兼容模式保留。"""
+        nodes: List[Comp.Node] = []
+
+        fc = self.config.get("forward_content", {}) or {}
+
+        if fc.get("include_title_author", True):
+            self._append_plain_node(nodes, bot_uin, bot_name, self._format_title_block(item))
+
+        if fc.get("include_text_desc", True) and item.desc and item.desc != item.title:
+            self._append_plain_node(nodes, bot_uin, bot_name, item.desc)
+
+        if fc.get("include_cover", True):
+            if item.item_type == "images" and item.images:
+                images = self._limit_images(item.images)
+                for idx, img in enumerate(images, 1):
+                    nodes.append(
+                        Comp.Node(
+                            uin=bot_uin,
+                            name=bot_name,
+                            content=[
+                                Comp.Plain(f"图 {idx}/{len(images)}"),
+                                Comp.Image.fromURL(img),
+                            ],
+                        )
+                    )
+            elif item.cover:
+                nodes.append(
+                    Comp.Node(
+                        uin=bot_uin,
+                        name=bot_name,
+                        content=[Comp.Image.fromURL(item.cover)],
+                    )
+                )
+
+        if fc.get("include_video_file", True) and item.video_url:
+            video_component = await self._build_video_component(item)
+            if video_component:
+                nodes.append(
+                    Comp.Node(
+                        uin=bot_uin,
+                        name=bot_name,
+                        content=[video_component],
+                    )
+                )
+
+        if fc.get("include_top_comments", True) and item.comments:
+            self._append_plain_node(
+                nodes, bot_uin, bot_name, "热门评论 Top 3:\n" + self._format_comments_block(item)
+            )
+
+        if fc.get("include_links", True):
+            link_text = self._format_link_block(item)
+            if link_text:
+                self._append_plain_node(nodes, bot_uin, bot_name, link_text)
+
+        if not nodes:
+            yield event.plain_result(
+                f"[分享解析] 内容已识别，但所有内容节点都被关闭了。"
+            )
+            return
+
+        yield event.chain_result([Comp.Nodes(nodes)])
+
+    async def _send_fallback(self, event: AstrMessageEvent, item: ParsedItem):
+        """非 QQ 平台：降级为多条普通消息。"""
+        fc = self.config.get("forward_content", {}) or {}
+        # 头部信息
+        yield event.plain_result(self._format_title_block(item))
+        if fc.get("include_text_desc", True) and item.desc and item.desc != item.title:
+            yield event.plain_result(item.desc)
+
+        if fc.get("include_cover", True):
+            if item.item_type == "images":
+                for img in self._limit_images(item.images):
+                    await event.send(MessageChain([Comp.Image.fromURL(img)]))
+            elif item.cover:
+                await event.send(MessageChain([Comp.Image.fromURL(item.cover)]))
+
+        if fc.get("include_video_file", True) and item.video_url:
+            video_component = await self._build_video_component(item)
+            if video_component:
+                await event.send(MessageChain([video_component]))
+
+        if fc.get("include_top_comments", True) and item.comments:
+            yield event.plain_result("热门评论 Top 3:\n" + self._format_comments_block(item))
+
+        if fc.get("include_links", True):
+            yield event.plain_result(self._format_link_block(item))
+
+    # ------------------------------------------------------------------ #
+    # 文本块构建
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _platform_tag(p: str) -> str:
+        return {
+            "douyin": "[抖音]",
+            "bilibili": "[哔哩哔哩]",
+            "xiaohongshu": "[小红书]",
+        }.get(p, f"[{p}]")
+
+    def _format_title_block(self, item: ParsedItem) -> str:
+        title = item.title or "(无标题)"
+        author = item.author or "未知作者"
+        return f"📖 标题：{title}\n👤 作者：{author}"
+
+    def _format_link_block(self, item: ParsedItem) -> str:
+        lines = ["🌐 原始链接：" + (item.canonical_url or item.raw_url)]
+        if item.video_url:
+            lines.append("🎞️ 无水印直链：" + item.video_url)
+        return "\n".join(lines)
+
+    def _format_comments_block(self, item: ParsedItem) -> str:
+        medals = ["🥇", "🥈", "🥉"]
+        lines = []
+        for idx, c in enumerate(item.comments[:3]):
+            content = (c.get("content") or "").strip()
+            if not content:
+                continue
+            lines.append(f"{medals[idx]} {content}")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------ #
+    # 视频下载
+    # ------------------------------------------------------------------ #
+    async def _download_video(self, item: ParsedItem) -> Optional[str]:
+        max_mb = int(self.config.get("video_max_size_mb", 80) or 80)
+        max_bytes = max_mb * 1024 * 1024
+        url = item.video_url
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+        }
+        if item.video_referer:
+            headers["Referer"] = item.video_referer
+
+        tmp_dir = tempfile.gettempdir()
+        path = os.path.join(tmp_dir, f"share_fwd_{item.platform}_{abs(hash(url))}.mp4")
+        try:
+            async with self._http.stream("GET", url, headers=headers, follow_redirects=True) as r:
+                if r.status_code != 200:
+                    self._dlog(f"视频下载状态码: {r.status_code}")
+                    return None
+                cl = r.headers.get("content-length")
+                if cl and int(cl) > max_bytes:
+                    self._dlog(f"视频体积 {int(cl) / 1024 / 1024:.1f}MB 超限")
+                    return None
+                size = 0
+                with open(path, "wb") as fp:
+                    async for chunk in r.aiter_bytes(64 * 1024):
+                        size += len(chunk)
+                        if size > max_bytes:
+                            fp.close()
+                            try:
+                                os.remove(path)
+                            except OSError:
+                                pass
+                            self._dlog("视频下载中超限，已中止")
+                            return None
+                        fp.write(chunk)
+            return path
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[share_forward] 视频下载失败: {e}")
+            return None
+
+    # ------------------------------------------------------------------ #
+    # 工具
+    # ------------------------------------------------------------------ #
+    def _append_section(
+        self,
+        nodes: List[Comp.Node],
+        bot_uin: str,
+        bot_name: str,
+        title: str,
+    ):
+        """添加分类标题节点，模拟“合并转发内的小分组”。"""
+        nodes.append(
+            Comp.Node(
+                uin=bot_uin,
+                name=bot_name,
+                content=[Comp.Plain(f"【{title}】")],
+            )
+        )
+
+    def _append_plain_node(
+        self,
+        nodes: List[Comp.Node],
+        bot_uin: str,
+        bot_name: str,
+        text: str,
+    ):
+        if not text:
+            return
+        nodes.append(
+            Comp.Node(
+                uin=bot_uin,
+                name=bot_name,
+                content=[Comp.Plain(text)],
+            )
+        )
+
+    def _check_access(self, event: AstrMessageEvent):
+        """检查私聊、群聊和统一会话白名单。"""
+        if not self.config.get("enable_in_private", True):
+            group_id = getattr(event.message_obj, "group_id", "") or ""
+            if not group_id:
+                return "BLOCKED"
+
+        group_whitelist = self.config.get("group_whitelist", []) or []
+        group_id = getattr(event.message_obj, "group_id", "") or ""
+        if group_whitelist and group_id:
+            allowed = {str(x).strip() for x in group_whitelist if str(x).strip()}
+            if str(group_id) not in allowed:
+                return "BLOCKED"
+
+        id_whitelist = self.config.get("id_whitelist", []) or []
+        if id_whitelist:
+            umo = getattr(event, "unified_msg_origin", "") or ""
+            allowed = {str(x).strip() for x in id_whitelist if str(x).strip()}
+            if umo not in allowed:
+                reply = self.config.get("whitelist_reply", "")
+                return event.plain_result(reply) if reply else "BLOCKED"
+
+        return None
+
+    def _extract_text(self, event: AstrMessageEvent) -> str:
+        """提取纯文本和 QQ 卡片 JSON 里的链接。"""
+        text = event.message_str or ""
+        try:
+            chain = event.get_messages()
+        except Exception:  # noqa: BLE001
+            chain = []
+        if not chain:
+            return text
+
+        # 专门 @ 其他机器人的消息不抢解析，避免多 Bot 场景误触发。
+        first = chain[0]
+        if first.__class__.__name__ == "At" and str(getattr(first, "qq", "")) != str(
+            event.get_self_id()
+        ):
+            return ""
+
+        for seg in chain:
+            if seg.__class__.__name__ != "Json":
+                continue
+            data = getattr(seg, "data", "") or ""
+            text += "\n" + _extract_url_from_json_payload(data)
+        return text
+
+    def _is_debounced(self, event: AstrMessageEvent, url: str) -> bool:
+        seconds = int(self.config.get("debounce_interval", 120) or 0)
+        if seconds <= 0:
+            return False
+        session = getattr(event, "unified_msg_origin", "") or "global"
+        key = f"{session}:{url}"
+        now = time.time()
+        expired = [k for k, ts in self._recent_links.items() if now - ts > seconds]
+        for k in expired:
+            self._recent_links.pop(k, None)
+        if key in self._recent_links and now - self._recent_links[key] <= seconds:
+            return True
+        return False
+
+    def _mark_debounce(self, event: AstrMessageEvent, url: str):
+        seconds = int(self.config.get("debounce_interval", 120) or 0)
+        if seconds <= 0:
+            return
+        session = getattr(event, "unified_msg_origin", "") or "global"
+        key = f"{session}:{url}"
+        now = time.time()
+        self._recent_links[key] = now
+
+    def _limit_images(self, images: List[str]) -> List[str]:
+        max_images = int(self.config.get("max_images_per_forward", 18) or 18)
+        if max_images <= 0:
+            return images
+        return images[:max_images]
+
+    async def _build_video_component(self, item: ParsedItem):
+        mode = self.config.get("video_send_mode", "direct_url")
+        if mode == "off":
+            return None
+        if mode == "direct_url":
+            try:
+                return Comp.Video.fromURL(item.video_url)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[share_forward] URL 视频组件构造失败: {e}")
+                return None
+        if mode == "download":
+            video_path = await self._download_video(item)
+            return Comp.Video.fromFileSystem(video_path) if video_path else None
+        return None
+
+    def _dlog(self, msg: str):
+        if self.config.get("debug_log"):
+            logger.info(f"[share_forward] {msg}")
+
+
+def _extract_url_from_json_payload(payload: str) -> str:
+    if not payload:
+        return ""
+    if _RE_URL.search(payload):
+        return _RE_URL.search(payload).group(0)
+    try:
+        data = json.loads(payload)
+    except Exception:  # noqa: BLE001
+        return ""
+    found: list[str] = []
+
+    def walk(obj):
+        if isinstance(obj, str):
+            m = _RE_URL.search(obj)
+            if m:
+                found.append(m.group(0))
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v)
+
+    walk(data)
+    return found[0] if found else ""

@@ -1,0 +1,186 @@
+{
+  "enabled": {
+    "description": "是否启用插件",
+    "type": "bool",
+    "default": true,
+    "hint": "总开关。关闭后不会处理任何分享链接。"
+  },
+  "use_forward_message": {
+    "description": "是否使用 QQ 合并转发",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后 aiocqhttp 平台会发送合并转发；关闭后降级为多条普通消息。参考同类插件经验，部分协议端合并转发视频不稳定时可关闭。"
+  },
+  "notify_when_triggered": {
+    "description": "触发后先发送提示",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，识别到可解析链接时会先发送“解析bot为您服务 ٩( 'ω' )و”，用于判断插件是否已触发。"
+  },
+  "forward_grouping_mode": {
+    "description": "合并转发分组模式",
+    "type": "string",
+    "default": "sectioned",
+    "options": [
+      "sectioned",
+      "flat"
+    ],
+    "hint": "sectioned：按 📌解析信息、📝正文内容、🖼️图片内容、🎬视频内容、💬热门评论、🔗链接信息 分组；flat：使用旧版平铺节点。"
+  },
+  "platforms": {
+    "description": "启用的平台",
+    "type": "object",
+    "hint": "勾选要识别和解析的平台",
+    "items": {
+      "douyin": {
+        "description": "抖音 / TikTok（v.douyin.com、douyin.com、iesdouyin.com）",
+        "type": "bool",
+        "default": true
+      },
+      "bilibili": {
+        "description": "哔哩哔哩 B 站（b23.tv、bilibili.com）",
+        "type": "bool",
+        "default": true
+      },
+      "xiaohongshu": {
+        "description": "小红书（xhslink.com、xiaohongshu.com）",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "forward_content": {
+    "description": "合并转发节点包含的内容",
+    "type": "object",
+    "hint": "选择要包含在合并转发里的素材",
+    "items": {
+      "include_title_author": {
+        "description": "标题 + 作者 + 平台标签节点",
+        "type": "bool",
+        "default": true
+      },
+      "include_cover": {
+        "description": "封面图（视频）/ 图集（图文）节点",
+        "type": "bool",
+        "default": true
+      },
+      "include_video_file": {
+        "description": "视频文件直发节点（受 QQ 文件大小限制，可能较慢）",
+        "type": "bool",
+        "default": true
+      },
+      "include_links": {
+        "description": "原始链接 + 无水印直链节点（方便用户自行下载）",
+        "type": "bool",
+        "default": true
+      },
+      "include_top_comments": {
+        "description": "高赞评论 Top 3 节点",
+        "type": "bool",
+        "default": true
+      },
+      "include_text_desc": {
+        "description": "正文/描述节点（抖音纯文字动态、B 站简介、小红书正文等）",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "video_max_size_mb": {
+    "description": "视频文件最大下载大小 (MB)",
+    "type": "int",
+    "default": 80,
+    "hint": "仅在“视频发送模式”为 download 时生效。超过此体积的视频不会作为视频文件直发，只保留直链。建议 50-100。"
+  },
+  "video_send_mode": {
+    "description": "视频发送模式",
+    "type": "string",
+    "default": "direct_url",
+    "options": [
+      "direct_url",
+      "download",
+      "off"
+    ],
+    "hint": "direct_url：直接把视频直链交给 QQ 协议端发送，速度快；download：先下载到本地再发送，兼容性更强但更慢；off：不发送视频文件，只保留直链。"
+  },
+  "max_images_per_forward": {
+    "description": "图集最多发送图片数",
+    "type": "int",
+    "default": 18,
+    "hint": "防止小红书/抖音大图集导致合并转发过大。设为 0 表示不限制。"
+  },
+  "request_timeout": {
+    "description": "单次请求超时时间 (秒)",
+    "type": "int",
+    "default": 15
+  },
+  "retry_count": {
+    "description": "解析失败重试次数",
+    "type": "int",
+    "default": 1,
+    "hint": "参考插件市场解析类插件的做法，平台偶发风控或网络抖动时可自动重试。设为 0 表示不重试。"
+  },
+  "debounce_interval": {
+    "description": "同链接防抖秒数",
+    "type": "int",
+    "default": 120,
+    "hint": "同一会话内重复发送同一链接时，防抖时间内只解析一次。设为 0 表示不防抖。"
+  },
+  "proxy": {
+    "description": "请求代理地址",
+    "type": "string",
+    "default": "",
+    "hint": "如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080。留空则直连。"
+  },
+  "enable_in_private": {
+    "description": "是否允许私聊触发",
+    "type": "bool",
+    "default": true
+  },
+  "group_whitelist": {
+    "description": "群聊白名单",
+    "type": "list",
+    "default": [],
+    "hint": "填写群号。留空表示所有群都可触发。"
+  },
+  "id_whitelist": {
+    "description": "统一会话白名单",
+    "type": "list",
+    "default": [],
+    "hint": "填写 event.unified_msg_origin，可用来精确限制群/私聊会话。留空表示不限制。"
+  },
+  "whitelist_reply": {
+    "description": "白名单拦截提示",
+    "type": "string",
+    "default": "",
+    "hint": "统一会话白名单未命中时的提示。留空则静默拦截。"
+  },
+  "douyin_cookie": {
+    "description": "抖音 Cookie（可选，用于解析评论与提升成功率）",
+    "type": "string",
+    "default": "",
+    "hint": "登录 douyin.com 后从浏览器 DevTools 复制完整 Cookie 字符串。留空则只用 HTML 降级方案，不能拿评论。"
+  },
+  "xiaohongshu_cookie": {
+    "description": "小红书 Cookie（必须包含 a1，否则会 461）",
+    "type": "string",
+    "default": "",
+    "hint": "登录 xiaohongshu.com 后从浏览器 DevTools 复制完整 Cookie，至少包含 a1=...; web_session=...。留空将无法解析小红书。"
+  },
+  "stop_event_after_match": {
+    "description": "命中链接并发送合并转发后阻断后续处理",
+    "type": "bool",
+    "default": true,
+    "hint": "建议开启，避免分享链接被 LLM 当作普通消息回复。"
+  },
+  "reply_when_fail": {
+    "description": "解析失败时是否提示用户",
+    "type": "bool",
+    "default": true
+  },
+  "debug_log": {
+    "description": "调试日志",
+    "type": "bool",
+    "default": false
+  }
+}
