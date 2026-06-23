@@ -73,7 +73,7 @@ class _ShareForwardVideoHandler(SimpleHTTPRequestHandler):
     "astrbot_plugin_share_forward",
     "TRAE",
     "把抖音/B站/小红书分享链接解析后打包成 QQ 合并转发",
-    "1.1.3",
+    "1.1.4",
 )
 class ShareForwardPlugin(Star):
     def __init__(self, context: Context, config: dict):
@@ -309,7 +309,11 @@ class ShareForwardPlugin(Star):
                 )
 
         # 4) 视频内容
-        if fc.get("include_video_file", True) and item.video_url:
+        if (
+            fc.get("include_video_file", True)
+            and item.item_type == "video"
+            and item.video_url
+        ):
             video_component = await self._build_video_component(item, cleanup_paths)
             if video_component:
                 self._append_section(nodes, bot_uin, bot_name, "🎬 视频内容")
@@ -388,7 +392,11 @@ class ShareForwardPlugin(Star):
                     )
                 )
 
-        if fc.get("include_video_file", True) and item.video_url:
+        if (
+            fc.get("include_video_file", True)
+            and item.item_type == "video"
+            and item.video_url
+        ):
             video_component = await self._build_video_component(item, cleanup_paths)
             if video_component:
                 nodes.append(
@@ -437,7 +445,11 @@ class ShareForwardPlugin(Star):
                 elif item.cover:
                     await event.send(MessageChain([Comp.Image.fromURL(item.cover)]))
 
-            if fc.get("include_video_file", True) and item.video_url:
+            if (
+                fc.get("include_video_file", True)
+                and item.item_type == "video"
+                and item.video_url
+            ):
                 video_component = await self._build_video_component(item, cleanup_paths)
                 if video_component:
                     await event.send(MessageChain([video_component]))
@@ -468,7 +480,7 @@ class ShareForwardPlugin(Star):
 
     def _format_link_block(self, item: ParsedItem) -> str:
         lines = ["🌐 原始链接：" + (item.canonical_url or item.raw_url)]
-        if item.video_url:
+        if item.item_type == "video" and item.video_url:
             label = "🎞️ 视频直链" if item.platform == "bilibili" else "🎞️ 无水印直链"
             lines.append(f"{label}：" + item.video_url)
         return "\n".join(lines)
